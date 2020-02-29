@@ -1,0 +1,52 @@
+apiVersion: kubeflow.org/v1
+kind: TFJob
+metadata:
+  name: nvidia1
+spec:
+  max-instances: 4
+  min-instances: 1
+  cleanPodPolicy: "All"
+  tfReplicaSpecs:
+    PS:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          terminationGracePeriodSeconds: 0
+          containers:
+          - args:
+            - 'curl -s https://lsalab.cs.nthu.edu.tw/~ericyeh/DRAGON/mnist-df.py | python3 -'
+            command:
+            - /bin/bash
+            - -c
+            image: tensorflow/tensorflow:1.15.0-py3
+            name: tensorflow
+            ports:
+            - containerPort: 2222
+              name: tfjob-port
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          terminationGracePeriodSeconds: 0
+          containers:
+          - args:
+            - 'curl -s https://lsalab.cs.nthu.edu.tw/~ericyeh/DRAGON/mnist-df.py | python3 -'
+            env:
+            - name: global_steps
+              value: "100000"
+            command:
+            - /bin/bash
+            - -c
+            image: tensorflow/tensorflow:1.15.0-gpu-py3
+            name: tensorflow
+            ports:
+            - containerPort: 2222
+              name: tfjob-port
+            resources:
+              requests:
+                cpu: "4"
+                memory: "4Gi"
+              limits:
+                nvidia.com/gpu: 1

@@ -12,8 +12,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/controller"
 
-	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	jclogger "github.com/NTHU-LSALAB/DRAGON/pkg/logger"
+	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 )
 
 const (
@@ -42,6 +42,22 @@ func (jc *JobController) AddPod(obj interface{}) {
 			if pod.Labels[jc.Controller.GetGroupNameLabelKey()] == jc.Controller.GetGroupNameLabelValue() {
 				logger.Info("This pod's job does not exist")
 			}
+			return
+		}
+
+		enqueue := false
+		if jc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+		if !enqueue {
 			return
 		}
 
@@ -87,6 +103,22 @@ func (jc *JobController) UpdatePod(old, cur interface{}) {
 	if controllerRefChanged && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
 		if job := jc.resolveControllerRef(oldPod.Namespace, oldControllerRef); job != nil {
+			enqueue := false
+			if jc.Option.KubeShareSupport {
+				enqueue = false
+				if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+					enqueue = true
+				}
+			} else {
+				enqueue = true
+				if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+					enqueue = false
+				}
+			}
+			if !enqueue {
+				return
+			}
+
 			logger.Infof("pod ControllerRef updated: %v, %v", curPod, oldPod)
 			jobKey, err := controller.KeyFunc(job)
 			if err != nil {
@@ -103,6 +135,23 @@ func (jc *JobController) UpdatePod(old, cur interface{}) {
 		if job == nil {
 			return
 		}
+
+		enqueue := false
+		if jc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+		if !enqueue {
+			return
+		}
+
 		logger.Debugf("pod has a ControllerRef: %v, %v", curPod, oldPod)
 		jobKey, err := controller.KeyFunc(job)
 		if err != nil {
@@ -146,6 +195,23 @@ func (jc *JobController) DeletePod(obj interface{}) {
 	if job == nil {
 		return
 	}
+
+	enqueue := false
+	if jc.Option.KubeShareSupport {
+		enqueue = false
+		if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+			enqueue = true
+		}
+	} else {
+		enqueue = true
+		if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+			enqueue = false
+		}
+	}
+	if !enqueue {
+		return
+	}
+
 	jobKey, err := controller.KeyFunc(job)
 	if err != nil {
 		return
@@ -203,6 +269,22 @@ func (jc *JobController) AddSharePod(obj interface{}) {
 			if pod.Labels[jc.Controller.GetGroupNameLabelKey()] == jc.Controller.GetGroupNameLabelValue() {
 				logger.Info("This pod's job does not exist")
 			}
+			return
+		}
+
+		enqueue := false
+		if jc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+		if !enqueue {
 			return
 		}
 
@@ -265,6 +347,22 @@ func (jc *JobController) UpdateSharePod(old, cur interface{}) {
 	if controllerRefChanged && oldControllerRef != nil {
 		// The ControllerRef was changed. Sync the old controller, if any.
 		if job := jc.resolveControllerRef(oldPod.Namespace, oldControllerRef); job != nil {
+			enqueue := false
+			if jc.Option.KubeShareSupport {
+				enqueue = false
+				if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+					enqueue = true
+				}
+			} else {
+				enqueue = true
+				if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+					enqueue = false
+				}
+			}
+			if !enqueue {
+				return
+			}
+
 			logger.Infof("pod ControllerRef updated: %v, %v", curPod, oldPod)
 			jobKey, err := controller.KeyFunc(job)
 			if err != nil {
@@ -281,6 +379,23 @@ func (jc *JobController) UpdateSharePod(old, cur interface{}) {
 		if job == nil {
 			return
 		}
+
+		enqueue := false
+		if jc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+		if !enqueue {
+			return
+		}
+
 		logger.Debugf("pod has a ControllerRef: %v, %v", curPod, oldPod)
 		jobKey, err := controller.KeyFunc(job)
 		if err != nil {
@@ -323,6 +438,23 @@ func (jc *JobController) DeleteSharePod(obj interface{}) {
 	if job == nil {
 		return
 	}
+
+	enqueue := false
+	if jc.Option.KubeShareSupport {
+		enqueue = false
+		if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+			enqueue = true
+		}
+	} else {
+		enqueue = true
+		if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+			enqueue = false
+		}
+	}
+	if !enqueue {
+		return
+	}
+
 	jobKey, err := controller.KeyFunc(job)
 	if err != nil {
 		return

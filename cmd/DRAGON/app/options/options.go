@@ -18,7 +18,7 @@ import (
 	"flag"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
 const DefaultResyncPeriod = 12 * time.Hour
@@ -34,6 +34,7 @@ type ServerOption struct {
 	Namespace            string
 	MonitoringPort       int
 	ResyncPeriod         time.Duration
+	KubeShareSupport     bool
 }
 
 // NewServerOption creates a new CMServer with a default config.
@@ -64,4 +65,6 @@ func (s *ServerOption) AddFlags(fs *flag.FlagSet) {
 	fs.IntVar(&s.MonitoringPort, "monitoring-port", 8443,
 		`Endpoint port for displaying monitoring metrics`)
 	fs.DurationVar(&s.ResyncPeriod, "resyc-period", DefaultResyncPeriod, "Resync interval of the tf-operator")
+
+	fs.BoolVar(&s.KubeShareSupport, "kubesharesupport", false, "Is KubeShare supported, default to false. (https://github.com/NTHU-LSALAB/KubeShare)")
 }

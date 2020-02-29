@@ -133,7 +133,7 @@ func NewTFController(
 	// after we support CRD validation.
 	tfJobInformerFactory tfjobinformers.SharedInformerFactory,
 	kubeshareClientSet kubeshareclientset.Interface,
-	option options.ServerOption,
+	option *options.ServerOption,
 	kubeshareInformerFactory kubeshareinformers.SharedInformerFactory,
 ) *TFController {
 
@@ -149,7 +149,7 @@ func NewTFController(
 	// Create base controller
 	log.Info("Creating Job controller")
 	jc := jobcontroller.NewJobController(tc, metav1.Duration{Duration: 15 * time.Second},
-		option.EnableGangScheduling, kubeClientSet, kubeshareClientSet, kubeBatchClientSet, kubeInformerFactory, tfv1.Plural)
+		option.EnableGangScheduling, kubeClientSet, kubeshareClientSet, kubeBatchClientSet, kubeInformerFactory, option, tfv1.Plural)
 	tc.JobController = jc
 	// Set sync handler.
 	tc.syncHandler = tc.syncTFJob
@@ -197,19 +197,22 @@ func NewTFController(
 
 	/*************** ERICYEH ***************/
 
-	scheduling.InitClientSets(kubeClientSet, tfJobClientSet, kubeshareClientSet)
-	cluster.InitClientSets(kubeClientSet, kubeshareClientSet)
+	scheduling.InitClientSets(kubeClientSet, tfJobClientSet, kubeshareClientSet, jc.Option)
+	cluster.InitClientSets(kubeClientSet, kubeshareClientSet, tc.Option)
 
-	kubeshareInformer := kubeshareInformerFactory.Kubeshare().V1().SharePods()
+	if jc.Option.KubeShareSupport {
 
-	kubeshareInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    jc.AddSharePod,
-		UpdateFunc: jc.UpdateSharePod,
-		DeleteFunc: jc.DeleteSharePod,
-	})
+		kubeshareInformer := kubeshareInformerFactory.Kubeshare().V1().SharePods()
 
-	tc.SharePodLister = kubeshareInformer.Lister()
-	tc.SharePodInformerSynced = kubeshareInformer.Informer().HasSynced
+		kubeshareInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    jc.AddSharePod,
+			UpdateFunc: jc.UpdateSharePod,
+			DeleteFunc: jc.DeleteSharePod,
+		})
+
+		tc.SharePodLister = kubeshareInformer.Lister()
+		tc.SharePodInformerSynced = kubeshareInformer.Informer().HasSynced
+	}
 
 	/*************** ERICYEH ***************/
 
@@ -230,8 +233,14 @@ func (tc *TFController) Run(threadiness int, stopCh <-chan struct{}) error {
 	// Wait for the caches to be synced before starting workers.
 	log.Info("Waiting for informer caches to sync")
 
-	if ok := cache.WaitForCacheSync(stopCh, tc.tfJobInformerSynced, tc.PodInformerSynced, tc.ServiceInformerSynced, tc.SharePodInformerSynced); !ok {
-		return fmt.Errorf("failed to wait for caches to sync")
+	if tc.Option.KubeShareSupport {
+		if ok := cache.WaitForCacheSync(stopCh, tc.tfJobInformerSynced, tc.PodInformerSynced, tc.ServiceInformerSynced, tc.SharePodInformerSynced); !ok {
+			return fmt.Errorf("failed to wait for caches to sync")
+		}
+	} else {
+		if ok := cache.WaitForCacheSync(stopCh, tc.tfJobInformerSynced, tc.PodInformerSynced, tc.ServiceInformerSynced); !ok {
+			return fmt.Errorf("failed to wait for caches to sync")
+		}
 	}
 	log.Infof("Starting %v workers", threadiness)
 	// Launch workers to process TFJob resources.
@@ -340,8 +349,28 @@ func (tc *TFController) enqueueTFJob(tfjob interface{}) {
 		return
 	}
 
-	// TODO: we may need add backoff here
-	tc.WorkQueue.Add(key)
+	enqueue := false
+	if t, ok := tfjob.(metav1.Object); ok {
+		if tc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+	} else {
+		log.Errorf("enqueueTFJob: Cannot interpret argument tfjob as *tfv1.TFJob? Am I wrong? tfjob: %#v", tfjob)
+		return
+	}
+
+	if enqueue {
+		// TODO: we may need add backoff here
+		tc.WorkQueue.Add(key)
+	}
 }
 
 // syncTFJob syncs the tfjob with the given key if it has had its expectations fulfilled, meaning
@@ -522,13 +551,27 @@ func (tc *TFController) reconcileTFJobs(tfjob *tfv1.TFJob) error {
 
 		oldStatus := tfjob.Status.DeepCopy()
 
-		pods, err := tc.GetSharePodsForJob(tfjob)
+		var pods []*v1.Pod = nil
+		var sharepods []*kubesharev1.SharePod = nil
 
-		if err != nil {
-			logger.Warnf("getPodsForTFJob error %v", err)
-			buf.WriteString(err.Error())
-			buf.WriteString("\n")
-			continue // return err
+		if tc.Option.KubeShareSupport {
+			sps, err := tc.GetSharePodsForJob(tfjob)
+			if err != nil {
+				logger.Warnf("getPodsForTFJob error %v", err)
+				buf.WriteString(err.Error())
+				buf.WriteString("\n")
+				continue // return err
+			}
+			sharepods = sps
+		} else {
+			ps, err := tc.GetPodsForJob(tfjob)
+			if err != nil {
+				logger.Warnf("getPodsForTFJob error %v", err)
+				buf.WriteString(err.Error())
+				buf.WriteString("\n")
+				continue // return err
+			}
+			pods = ps
 		}
 
 		services, err := tc.GetServicesForJob(tfjob)
@@ -542,12 +585,18 @@ func (tc *TFController) reconcileTFJobs(tfjob *tfv1.TFJob) error {
 
 		// retrieve the previous number of retry
 		previousRetry := tc.WorkQueue.NumRequeues(tfjobKey)
-
-		// activePods := k8sutil.FilterActivePods(pods)
-		activePods := k8sutil.FilterActiveSharePods(pods)
-		active := int32(len(activePods))
-		// failed := k8sutil.FilterPodCount(pods, v1.PodFailed)
-		failed := k8sutil.FilterSharePodCount(pods, v1.PodFailed)
+		active := int32(-1)
+		if tc.Option.KubeShareSupport {
+			active = int32(len(k8sutil.FilterActiveSharePods(sharepods)))
+		} else {
+			active = int32(len(k8sutil.FilterActivePods(pods)))
+		}
+		failed := int32(-1)
+		if tc.Option.KubeShareSupport {
+			failed = k8sutil.FilterSharePodCount(sharepods, v1.PodFailed)
+		} else {
+			failed = k8sutil.FilterPodCount(pods, v1.PodFailed)
+		}
 		totalReplicas := getTotalReplicas(tfjob)
 		prevReplicasFailedNum := getTotalFailedReplicas(tfjob)
 
@@ -564,7 +613,11 @@ func (tc *TFController) reconcileTFJobs(tfjob *tfv1.TFJob) error {
 			exceedsBackoffLimit = jobHasNewFailure && (active != totalReplicas) &&
 				(int32(previousRetry)+1 > *tfjob.Spec.BackoffLimit)
 
-			pastBackoffLimit, err = tc.pastBackoffLimit(tfjob, pods)
+			if tc.Option.KubeShareSupport {
+				pastBackoffLimit, err = tc.pastBackoffLimitSharePods(tfjob, sharepods)
+			} else {
+				pastBackoffLimit, err = tc.pastBackoffLimitPods(tfjob, pods)
+			}
 			if err != nil {
 				logger.Warnf("pastBackoffLimit error %v", err)
 				buf.WriteString(err.Error())
@@ -585,13 +638,24 @@ func (tc *TFController) reconcileTFJobs(tfjob *tfv1.TFJob) error {
 
 		// If the TFJob is terminated, delete all pods and services.
 		if isSucceeded(tfjob.Status) || isFailed(tfjob.Status) || tfJobExceedsLimit {
-			if err := tc.deleteSharePodsAndServices(tfjob, pods); err != nil {
-				logger.Warnf("deleteSharePodsAndServices error %v", err)
-				buf.WriteString(err.Error())
-				buf.WriteString("\n")
-				continue // return err
+			if tc.Option.KubeShareSupport {
+				if err := tc.deleteSharePodsAndServices(tfjob, sharepods); err != nil {
+					logger.Warnf("deleteSharePodsAndServices error %v", err)
+					buf.WriteString(err.Error())
+					buf.WriteString("\n")
+					continue // return err
+				}
+			} else {
+				if err := tc.deletePodsAndServices(tfjob, pods); err != nil {
+					logger.Warnf("deletePodsAndServices error %v", err)
+					buf.WriteString(err.Error())
+					buf.WriteString("\n")
+					continue // return err
+				}
 			}
 			finishedJobsKillLater.Add(runningjob) // tc.RunningQueue.Remove(runningjob)
+			_now := metav1.Now()
+			runningjob.Status.FinishedTime = &_now
 			tc.FinishedQueue.Add(runningjob)
 
 			if tfJobExceedsLimit {
@@ -657,16 +721,28 @@ func (tc *TFController) reconcileTFJobs(tfjob *tfv1.TFJob) error {
 
 		// Diff current active pods/services with replicas.
 		for rtype, spec := range tfjob.Spec.TFReplicaSpecs {
-			err, currentIndex := tc.reconcilePods(tfjob, pods, rtype, spec, replicasStatus, runningjob.ReplicasPlacementPlan[rtype])
-			if err != nil {
-				logger.Warnf("reconcilePods error %v", err)
-				buf.WriteString(err.Error())
-				buf.WriteString("\n")
-				continue // return err
+			var currentIndex []int
+			if tc.Option.KubeShareSupport {
+				err, curidx := tc.reconcileSharePods(tfjob, sharepods, rtype, spec, replicasStatus, runningjob.ReplicasPlacementPlan[rtype])
+				if err != nil {
+					logger.Warnf("reconcilePods error %v", err)
+					buf.WriteString(err.Error())
+					buf.WriteString("\n")
+					continue // return err
+				}
+				currentIndex = curidx
+			} else {
+				err, curidx := tc.reconcilePods(tfjob, pods, rtype, spec, replicasStatus, runningjob.ReplicasPlacementPlan[rtype])
+				if err != nil {
+					logger.Warnf("reconcilePods error %v", err)
+					buf.WriteString(err.Error())
+					buf.WriteString("\n")
+					continue // return err
+				}
+				currentIndex = curidx
 			}
 
 			err = tc.reconcileServices(tfjob, services, rtype, spec, currentIndex, int(*tfjob.Spec.MaxInstances))
-
 			if err != nil {
 				logger.Warnf("reconcileServices error %v", err)
 				buf.WriteString(err.Error())
@@ -724,7 +800,47 @@ func (tc *TFController) satisfiedExpectations(tfjob *tfv1.TFJob) bool {
 
 // pastBackoffLimit checks if container restartCounts sum exceeds BackoffLimit
 // this method applies only to pods with restartPolicy == OnFailure or Always
-func (tc *TFController) pastBackoffLimit(tfjob *tfv1.TFJob, pods []*kubesharev1.SharePod) (bool, error) {
+func (tc *TFController) pastBackoffLimitPods(tfjob *tfv1.TFJob, pods []*v1.Pod) (bool, error) {
+	if tfjob.Spec.BackoffLimit == nil {
+		return false, nil
+	}
+	logger := tflogger.LoggerForJob(tfjob)
+	result := int32(0)
+	for rtype, spec := range tfjob.Spec.TFReplicaSpecs {
+		if spec.RestartPolicy != common.RestartPolicyOnFailure && spec.RestartPolicy != common.RestartPolicyAlways {
+			logger.Warnf("The restart policy of replica %v of the job %v is not OnFailure or Always. Not counted in backoff limit.", rtype, tfjob.Name)
+			continue
+		}
+		// Convert TFReplicaType to lower string.
+		rt := strings.ToLower(string(rtype))
+		pods, err := tc.FilterPodsForReplicaType(pods, rt)
+		if err != nil {
+			return false, err
+		}
+		for i := range pods {
+			po := pods[i]
+			if po.Status.Phase == v1.PodRunning || po.Status.Phase == v1.PodPending {
+				for j := range po.Status.InitContainerStatuses {
+					stat := po.Status.InitContainerStatuses[j]
+					result += stat.RestartCount
+				}
+				for j := range po.Status.ContainerStatuses {
+					stat := po.Status.ContainerStatuses[j]
+					result += stat.RestartCount
+				}
+			}
+		}
+	}
+
+	if *tfjob.Spec.BackoffLimit == 0 {
+		return result > 0, nil
+	}
+	return result >= *tfjob.Spec.BackoffLimit, nil
+}
+
+// pastBackoffLimit checks if container restartCounts sum exceeds BackoffLimit
+// this method applies only to pods with restartPolicy == OnFailure or Always
+func (tc *TFController) pastBackoffLimitSharePods(tfjob *tfv1.TFJob, pods []*kubesharev1.SharePod) (bool, error) {
 	if tfjob.Spec.BackoffLimit == nil {
 		return false, nil
 	}

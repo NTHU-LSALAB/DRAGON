@@ -5,7 +5,7 @@ import (
 	"strconv"
 
 	log "github.com/sirupsen/logrus"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/kubernetes/pkg/controller"
@@ -27,6 +27,22 @@ func (jc *JobController) AddService(obj interface{}) {
 	if controllerRef := metav1.GetControllerOf(service); controllerRef != nil {
 		job := jc.resolveControllerRef(service.Namespace, controllerRef)
 		if job == nil {
+			return
+		}
+
+		enqueue := false
+		if jc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := job.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+		if !enqueue {
 			return
 		}
 

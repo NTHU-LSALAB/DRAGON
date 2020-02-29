@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NTHU-LSALAB/DRAGON/cmd/DRAGON/app/options"
 	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	kubeshareclientset "github.com/NTHU-LSALAB/KubeShare/pkg/client/clientset/versioned"
 
@@ -19,20 +20,16 @@ import (
 var (
 	kubeClientSet      kubeclientset.Interface
 	kubeshareClientSet kubeshareclientset.Interface
+	option             *options.ServerOption
 )
 
-func InitClientSets(it kubeclientset.Interface, mit kubeshareclientset.Interface) {
-	kubeClientSet, kubeshareClientSet = it, mit
+func InitClientSets(it kubeclientset.Interface, mit kubeshareclientset.Interface, op *options.ServerOption) {
+	kubeClientSet, kubeshareClientSet, option = it, mit, op
 }
 
 const (
-	ResourceNvidiaGPU         = "nvidia.com/gpu"
-	ResourceLsalabGPU         = "kubeshare/gpu"
-	ResourceLsalabGPUID       = "kubeshare/GPUID"
-	ResourceLsalabGPUReq      = "kubeshare/gpu_request"
-	ResourceLsalabGPULimit    = "kubeshare/gpu_limit"
-	ResourceLsalabGPUMem      = "kubeshare/gpu_mem"
-	ResourceKubeShareNodeInfo = "kubeshare/gpu_info"
+	ResourceKubeShareGPU = "kubeshare/gpu"
+	ResourceNvidiaGPU    = "nvidia.com/gpu"
 )
 
 /* ------------------- struct PodRequest start ------------------- */
@@ -152,10 +149,14 @@ func SyncClusterResource() (nodeResources NodeResources, err error) {
 		log.Errorf("Error when listing Pod: %s", err)
 		return nil, err
 	}
-	sharePodList, err := kubeshareClientSet.KubeshareV1().SharePods("").List(metav1.ListOptions{})
-	if err != nil {
-		log.Errorf("Error when listing SharePod: %s", err)
-		return nil, err
+	var sharePodList *kubesharev1.SharePodList = nil
+	if option.KubeShareSupport {
+		spl, err := kubeshareClientSet.KubeshareV1().SharePods("").List(metav1.ListOptions{})
+		if err != nil {
+			log.Errorf("Error when listing SharePod: %s", err)
+			return nil, err
+		}
+		sharePodList = spl
 	}
 
 	syncPodResources(nodeResources, podList, sharePodList)
@@ -169,12 +170,17 @@ func syncPodResources(nodeRes NodeResources, podList *corev1.PodList, sharePodLi
 		// 1. If Pod is not scheduled, it don't use resources.
 		// 2. If Pod's name contains kubeshare-vgpu is managed by SharePod,
 		//    resource usage will be calcuated later.
-		if nodeName == "" || strings.Contains(pod.Name, "kubeshare-vgpu") {
+		if nodeName == "" || strings.Contains(pod.Name, kubesharev1.KubeShareDummyPodName) {
 			continue
 		}
-		// Assume all Pod have label "group-name": "kubeflow.org" is managed by SharePod.
-		// Calculating their resource usage later.
-		if val, ok := pod.ObjectMeta.Labels["group-name"]; ok && val == "kubeflow.org" {
+		ownedBySharePod := false
+		for _, owner := range pod.ObjectMeta.OwnerReferences {
+			if owner.Kind == "SharePod" {
+				ownedBySharePod = true
+				break
+			}
+		}
+		if ownedBySharePod {
 			continue
 		}
 		// If a running Pod is on the node we don't want, don't calculate it.
@@ -186,67 +192,69 @@ func syncPodResources(nodeRes NodeResources, podList *corev1.PodList, sharePodLi
 		for _, container := range pod.Spec.Containers {
 			nodeRes[nodeName].CpuFree -= container.Resources.Requests.Cpu().MilliValue()
 			nodeRes[nodeName].MemFree -= container.Resources.Requests.Memory().MilliValue()
-			gpu := container.Resources.Requests[ResourceNvidiaGPU]
+			gpu := container.Resources.Limits[kubesharev1.ResourceNVIDIAGPU]
 			nodeRes[nodeName].GpuFreeCount -= int(gpu.Value())
 		}
 	}
 
-	for _, SharePod := range sharePodList.Items {
-		nodeName := SharePod.Spec.NodeName
-		// 1. If Pod is not scheduled, it don't use resources.
-		if nodeName == "" {
-			continue
-		}
-		// If a running Pod is on the node we don't want, don't calculate it.
-		// ex. on master has NoSchedule Taint.
-		if _, ok := nodeRes[nodeName]; !ok {
-			continue
-		}
-		if SharePod.Status.PodStatus != nil && (SharePod.Status.PodStatus.Phase == "Succeeded" || SharePod.Status.PodStatus.Phase == "Failed") {
-			continue
-		}
+	if option.KubeShareSupport {
+		for _, SharePod := range sharePodList.Items {
+			nodeName := SharePod.Spec.NodeName
+			// 1. If Pod is not scheduled, it don't use resources.
+			if nodeName == "" {
+				continue
+			}
+			// If a running Pod is on the node we don't want, don't calculate it.
+			// ex. on master has NoSchedule Taint.
+			if _, ok := nodeRes[nodeName]; !ok {
+				continue
+			}
+			if SharePod.Status.PodStatus != nil && (SharePod.Status.PodStatus.Phase == "Succeeded" || SharePod.Status.PodStatus.Phase == "Failed") {
+				continue
+			}
 
-		for _, container := range SharePod.Spec.Containers {
-			nodeRes[nodeName].CpuFree -= container.Resources.Requests.Cpu().MilliValue()
-			nodeRes[nodeName].MemFree -= container.Resources.Requests.Memory().MilliValue()
-		}
+			for _, container := range SharePod.Spec.Containers {
+				nodeRes[nodeName].CpuFree -= container.Resources.Requests.Cpu().MilliValue()
+				nodeRes[nodeName].MemFree -= container.Resources.Requests.Memory().MilliValue()
+			}
 
-		if gpuid, gpuidok := SharePod.ObjectMeta.Annotations[ResourceLsalabGPUID]; gpuidok && gpuid != "" {
-			if gpureq, gpureqok := SharePod.ObjectMeta.Annotations[ResourceLsalabGPUReq]; gpureqok && gpureq != "" {
-				if gpumem, gpumemok := SharePod.ObjectMeta.Annotations[ResourceLsalabGPUMem]; gpumemok && gpumem != "" {
-					gpureqf, err := strconv.ParseFloat(gpureq, 64)
-					if err != nil {
-						log.Errorf("Cannot parse nvidia gpu request, pod: %s/%s, gpu req: %s", SharePod.Namespace, SharePod.Name, SharePod.ObjectMeta.Annotations[ResourceLsalabGPUReq])
-						break
-					}
-					gpureqi := int64(math.Ceil(gpureqf * (float64)(1000.0)))
+			if gpuid, gpuidok := SharePod.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPUID]; gpuidok && gpuid != "" {
+				if gpureq, gpureqok := SharePod.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPURequest]; gpureqok && gpureq != "" {
+					if gpumem, gpumemok := SharePod.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPUMemory]; gpumemok && gpumem != "" {
+						gpureqf, err := strconv.ParseFloat(gpureq, 64)
+						if err != nil {
+							log.Errorf("Cannot parse nvidia gpu request, pod: %s/%s, gpu req: %s", SharePod.Namespace, SharePod.Name, SharePod.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPURequest])
+							break
+						}
+						gpureqi := int64(math.Ceil(gpureqf * (float64)(1000.0)))
 
-					gpumemi, err := strconv.ParseInt(gpumem, 10, 64)
-					if err != nil {
-						log.Errorf("Cannot parse nvidia gpu memory, pod: %s/%s, gpu req: %s", SharePod.Namespace, SharePod.Name, SharePod.ObjectMeta.Annotations[ResourceLsalabGPUMem])
-						break
-					}
+						gpumemi, err := strconv.ParseInt(gpumem, 10, 64)
+						if err != nil {
+							log.Errorf("Cannot parse nvidia gpu memory, pod: %s/%s, gpu req: %s", SharePod.Namespace, SharePod.Name, SharePod.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPUMemory])
+							break
+						}
 
-					if gpuInfo, ok := nodeRes[nodeName].GpuFree[gpuid]; !ok {
-						if nodeRes[nodeName].GpuFreeCount > 0 {
-							nodeRes[nodeName].GpuFreeCount--
-							nodeRes[nodeName].GpuFree[gpuid] = &GPUInfo{
-								GPUFreeReq: 1000 - gpureqi,
-								GPUFreeMem: nodeRes[nodeName].GpuMemTotal - gpumemi,
+						if gpuInfo, ok := nodeRes[nodeName].GpuFree[gpuid]; !ok {
+							if nodeRes[nodeName].GpuFreeCount > 0 {
+								nodeRes[nodeName].GpuFreeCount--
+								nodeRes[nodeName].GpuFree[gpuid] = &GPUInfo{
+									GPUFreeReq: 1000 - gpureqi,
+									GPUFreeMem: nodeRes[nodeName].GpuMemTotal - gpumemi,
+								}
+							} else {
+								log.Errorf("==================================")
+								log.Errorf("Bug! The rest number of free GPU is not enough for SharePod! GPUID: %s", gpuid)
+								for errID, errGPU := range nodeRes[nodeName].GpuFree {
+									log.Errorf("GPUID: %s", errID)
+									log.Errorf("    Req: %d", errGPU.GPUFreeReq)
+									log.Errorf("    Mem: %d", errGPU.GPUFreeMem)
+								}
+								log.Errorf("==================================")
 							}
 						} else {
-							log.Errorf("==================================")
-							log.Errorf("Bug! The rest number of free GPU is not enough for SharePod! GPUID: %s", gpuid)
-							for errID, errGPU := range nodeRes[nodeName].GpuFree {
-								log.Errorf("GPUID: %s", errID)
-								log.Errorf("    Req: %d", errGPU.GPUFreeReq)
-								log.Errorf("    Mem: %d", errGPU.GPUFreeMem)
-							}
-							log.Errorf("==================================")
+							gpuInfo.GPUFreeReq -= gpureqi
+							gpuInfo.GPUFreeMem -= gpumemi
 						}
-					} else {
-						gpuInfo.GPUFreeReq -= gpureqi
-						gpuInfo.GPUFreeMem -= gpumemi
 					}
 				}
 			}
@@ -275,11 +283,11 @@ func syncNodeResources(nodeList *corev1.NodeList) (nodeResources NodeResources) 
 		cpu := node.Status.Allocatable.Cpu().MilliValue()
 		mem := node.Status.Allocatable.Memory().MilliValue()
 		gpuNum := func() int {
-			tmp := node.Status.Allocatable[ResourceNvidiaGPU]
+			tmp := node.Status.Allocatable[kubesharev1.ResourceNVIDIAGPU]
 			return int(tmp.Value())
 		}()
 		gpuMem := func() int64 {
-			if gpuInfo, ok := node.ObjectMeta.Annotations[ResourceKubeShareNodeInfo]; ok {
+			if gpuInfo, ok := node.ObjectMeta.Annotations[kubesharev1.KubeShareNodeGPUInfo]; ok {
 				gpuInfoArr := strings.Split(gpuInfo, ",")
 				if len(gpuInfoArr) >= 1 {
 					gpuArr := strings.Split(gpuInfoArr[0], ":")

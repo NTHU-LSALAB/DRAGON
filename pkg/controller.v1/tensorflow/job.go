@@ -10,11 +10,11 @@ import (
 	metav1unstructured "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/scheme"
 
-	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	common "github.com/NTHU-LSALAB/DRAGON/pkg/apis/common/v1"
 	tfv1 "github.com/NTHU-LSALAB/DRAGON/pkg/apis/tensorflow/v1"
 	tflogger "github.com/NTHU-LSALAB/DRAGON/pkg/logger"
 	"github.com/NTHU-LSALAB/DRAGON/pkg/util/k8sutil"
+	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +33,27 @@ var (
 
 // When a pod is added, set the defaults and enqueue the current tfjob.
 func (tc *TFController) addTFJob(obj interface{}) {
+	enqueue := false
+	if t, ok := obj.(metav1.Object); ok {
+		if tc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+	} else {
+		log.Errorf("enqueueTFJob: Cannot interpret argument tfjob as *tfv1.TFJob? Am I wrong? tfjob: %#v", obj)
+		return
+	}
+	if !enqueue {
+		return
+	}
+
 	// Convert from unstructured object.
 	tfJob, err := tfJobFromUnstructured(obj)
 	if err != nil {
@@ -113,6 +134,27 @@ func (tc *TFController) addTFJob(obj interface{}) {
 
 // When a pod is updated, enqueue the current tfjob.
 func (tc *TFController) updateTFJob(old, cur interface{}) {
+	enqueue := false
+	if t, ok := cur.(metav1.Object); ok {
+		if tc.Option.KubeShareSupport {
+			enqueue = false
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = true
+			}
+		} else {
+			enqueue = true
+			if val, okk := t.GetAnnotations()["DRAGON_KUBESHARE"]; okk && val == "true" {
+				enqueue = false
+			}
+		}
+	} else {
+		log.Errorf("enqueueTFJob: Cannot interpret argument tfjob as *tfv1.TFJob? Am I wrong? tfjob: %#v", cur)
+		return
+	}
+	if !enqueue {
+		return
+	}
+
 	oldTFJob, err := tfJobFromUnstructured(old)
 	if err != nil {
 		return

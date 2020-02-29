@@ -10,6 +10,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/NTHU-LSALAB/DRAGON/cmd/DRAGON/app/options"
 	common "github.com/NTHU-LSALAB/DRAGON/pkg/apis/common/v1"
 	tfv1 "github.com/NTHU-LSALAB/DRAGON/pkg/apis/tensorflow/v1"
 	tfjobclientset "github.com/NTHU-LSALAB/DRAGON/pkg/client/clientset/versioned"
@@ -18,6 +19,7 @@ import (
 	kubeshareclientset "github.com/NTHU-LSALAB/KubeShare/pkg/client/clientset/versioned"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubeclientset "k8s.io/client-go/kubernetes"
 )
@@ -27,10 +29,11 @@ var (
 	tfJobClientSet     tfjobclientset.Interface
 	kubeshareClientSet kubeshareclientset.Interface
 	lastActionTime     metav1.Time = metav1.Now()
+	option             *options.ServerOption
 )
 
-func InitClientSets(itk kubeclientset.Interface, itt tfjobclientset.Interface, itm kubeshareclientset.Interface) {
-	kubeClientSet, tfJobClientSet, kubeshareClientSet = itk, itt, itm
+func InitClientSets(itk kubeclientset.Interface, itt tfjobclientset.Interface, itm kubeshareclientset.Interface, op *options.ServerOption) {
+	kubeClientSet, tfJobClientSet, kubeshareClientSet, option = itk, itt, itm, op
 }
 
 /* ------------------- struct JobQueue start ------------------- */
@@ -86,6 +89,9 @@ func NewTrainingJob(tfjob *tfv1.TFJob) *TrainingJob {
 }
 
 func (this *TrainingJob) UpdateTFJobTime() error {
+	// if option.KubeShareSupport {
+	// 	panic("FFFFFFFFFFUUUUUUUUUUUUUUCCCCCCCCCCCCCCCKKKKKKKKKKKKKKKKKK")
+	// }
 	log.Infof("UpdateTFJobTime: updating tfjob time status")
 	oldJob, err := tfJobClientSet.KubeflowV1().TFJobs(this.Namespace).Get(this.Name, metav1.GetOptions{})
 	if err != nil {
@@ -275,22 +281,30 @@ func GetPodRequestsFromPodTemplate(template *corev1.PodTemplateSpec) *cluster.Po
 		tmp.MemReq += container.Resources.Requests.Memory().MilliValue()
 	}
 
-	if gpureq, gpureqok := template.ObjectMeta.Annotations[cluster.ResourceLsalabGPUReq]; gpureqok && gpureq != "" {
-		gpureqf, err := strconv.ParseFloat(gpureq, 64)
-		if err != nil {
-			log.Errorf("Cannot parse nvidia gpu request, pod: %s/%s, gpu req: %s", template.Namespace, template.Name, template.ObjectMeta.Annotations[cluster.ResourceLsalabGPUReq])
-			return nil
+	if option.KubeShareSupport {
+		if gpureq, gpureqok := template.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPURequest]; gpureqok && gpureq != "" {
+			gpureqf, err := strconv.ParseFloat(gpureq, 64)
+			if err != nil {
+				log.Errorf("Cannot parse nvidia gpu request, pod: %s/%s, gpu req: %s", template.Namespace, template.Name, template.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPURequest])
+				return nil
+			}
+			gpureqi := int64(math.Ceil(gpureqf * (float64)(1000.0)))
+			tmp.GpuReq += gpureqi
 		}
-		gpureqi := int64(math.Ceil(gpureqf * (float64)(1000.0)))
-		tmp.GpuReq += gpureqi
-	}
-	if gpumem, gpumemok := template.ObjectMeta.Annotations[cluster.ResourceLsalabGPUMem]; gpumemok && gpumem != "" {
-		gpumemi, err := strconv.ParseInt(gpumem, 10, 64)
-		if err != nil {
-			log.Errorf("Cannot parse nvidia gpu memory, pod: %s/%s, gpu req: %s", template.Namespace, template.Name, template.ObjectMeta.Annotations[cluster.ResourceLsalabGPUMem])
-			return nil
+		if gpumem, gpumemok := template.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPUMemory]; gpumemok && gpumem != "" {
+			gpumemi, err := strconv.ParseInt(gpumem, 10, 64)
+			if err != nil {
+				log.Errorf("Cannot parse nvidia gpu memory, pod: %s/%s, gpu req: %s", template.Namespace, template.Name, template.ObjectMeta.Annotations[kubesharev1.KubeShareResourceGPUMemory])
+				return nil
+			}
+			tmp.GpuMemReq += gpumemi
 		}
-		tmp.GpuMemReq += gpumemi
+	} else {
+		for _, container := range template.Spec.Containers {
+			var gpuNum resource.Quantity
+			gpuNum.Add(container.Resources.Limits[kubesharev1.ResourceNVIDIAGPU])
+			tmp.GpuReq += gpuNum.MilliValue()
+		}
 	}
 	return &tmp
 }
@@ -373,6 +387,7 @@ func SchedulingAlgorithm(
 				}),
 				nodeRes,
 			)
+			// If high priority job can be scheduled, schedule it here... LOL
 			if ok[0] >= 1 {
 				var nodeName string
 				var worker *WorkerResources
@@ -391,7 +406,7 @@ func SchedulingAlgorithm(
 						if latestSharePod.Annotations == nil {
 							latestSharePod.Annotations = map[string]string{}
 						}
-						latestSharePod.Annotations[cluster.ResourceLsalabGPUID] = (*worker).Workers[cluster.ResourceLsalabGPU]
+						latestSharePod.Annotations[kubesharev1.KubeShareResourceGPUID] = (*worker).Workers[cluster.ResourceKubeShareGPU]
 					}
 					_, errr := kubeshareClientSet.KubeshareV1().SharePods(latestSharePod.Namespace).Update(latestSharePod)
 					if errr != nil {
@@ -437,6 +452,8 @@ func SchedulingAlgorithm(
 
 					waitingQueue.Remove(job)
 					runningQueue.Add(job)
+					now := metav1.Now()
+					job.Status.StartRunTime = &now
 
 					lastActionTime = metav1.Now()
 					break
@@ -503,45 +520,72 @@ func ScheduleJob(requestsGroups *[]*cluster.PodRequests, constNodeRes cluster.No
 					break
 				}
 
-				hasFreeGPU, freeGPUID := false, ""
-				if request.GpuReq > 0 {
-					for id, gpu := range node.GpuFree {
-						if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
-							hasFreeGPU, freeGPUID = true, id
-							break
+				if option.KubeShareSupport { // kubeshare/gpu
+					hasFreeGPU, freeGPUID := false, ""
+					if request.GpuReq > 0 {
+						for id, gpu := range node.GpuFree {
+							if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
+								hasFreeGPU, freeGPUID = true, id
+								break
+							}
 						}
-					}
-					if !hasFreeGPU {
-						if node.GpuFreeCount <= 0 {
-							oneNodeOk = false
-							stop = true
-							log.Infof("Break in gpu request 1")
-							break
-						} else {
-							node.GpuFreeCount--
-							freeGPUID = kubesharev1.NewGPUID(5)
-							node.GpuFree[freeGPUID] = &cluster.GPUInfo{
-								GPUFreeReq: 1000,
-								GPUFreeMem: node.GpuMemTotal,
+						if !hasFreeGPU {
+							if node.GpuFreeCount <= 0 {
+								oneNodeOk = false
+								stop = true
+								log.Infof("Break in gpu request 1")
+								break
+							} else {
+								node.GpuFreeCount--
+								freeGPUID = kubesharev1.NewGPUID(5)
+								node.GpuFree[freeGPUID] = &cluster.GPUInfo{
+									GPUFreeReq: 1000,
+									GPUFreeMem: node.GpuMemTotal,
+								}
 							}
 						}
 					}
-				}
 
-				node.CpuFree -= request.CpuReq
-				node.MemFree -= request.MemReq
-				if request.GpuReq > 0 {
-					node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
-					node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
-				}
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
+						node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
+					}
 
-				t := &WorkerResources{
-					Workers:  map[string]string{},
-					Critical: false,
-				}
-				(*tmps[groupIdx])[NewWorkerID(5)] = t
-				if request.GpuReq > 0 {
-					(*t).Workers[cluster.ResourceLsalabGPU] = freeGPUID
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*tmps[groupIdx])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceKubeShareGPU] = freeGPUID
+					}
+				} else { // nvidia.com/gpu
+					if request.GpuReq > 0 {
+						if node.GpuFreeCount < int(request.GpuReq/1000) {
+							oneNodeOk = false
+							stop = true
+							log.Infof("Break in nvidia.com/gpu request")
+							break
+						}
+					}
+
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFreeCount -= int(request.GpuReq / 1000)
+					}
+
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*tmps[groupIdx])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceNvidiaGPU] = fmt.Sprintf("%d", (request.GpuReq / 1000))
+					}
+					// log.Infof("*****************ERICYEH 1*********************: %d, %v", request.GpuReq, t.Workers)
 				}
 			}
 			if stop {
@@ -608,45 +652,70 @@ func ScheduleJob(requestsGroups *[]*cluster.PodRequests, constNodeRes cluster.No
 					break
 				}
 
-				hasFreeGPU, freeGPUID := false, ""
-				if request.GpuReq > 0 {
-					for id, gpu := range node.GpuFree {
-						if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
-							hasFreeGPU, freeGPUID = true, id
-							log.Infof("Break in cpu or mem request 2")
-							break
+				if option.KubeShareSupport { // kubeshare/gpu
+					hasFreeGPU, freeGPUID := false, ""
+					if request.GpuReq > 0 {
+						for id, gpu := range node.GpuFree {
+							if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
+								hasFreeGPU, freeGPUID = true, id
+								log.Infof("Break in cpu or mem request 2")
+								break
+							}
 						}
-					}
-					if !hasFreeGPU {
-						if node.GpuFreeCount <= 0 {
-							stop = true
-							log.Infof("Break in gpu request")
-							break
-						} else {
-							node.GpuFreeCount--
-							freeGPUID = kubesharev1.NewGPUID(5)
-							node.GpuFree[freeGPUID] = &cluster.GPUInfo{
-								GPUFreeReq: 1000,
-								GPUFreeMem: node.GpuMemTotal,
+						if !hasFreeGPU {
+							if node.GpuFreeCount <= 0 {
+								stop = true
+								log.Infof("Break in gpu request")
+								break
+							} else {
+								node.GpuFreeCount--
+								freeGPUID = kubesharev1.NewGPUID(5)
+								node.GpuFree[freeGPUID] = &cluster.GPUInfo{
+									GPUFreeReq: 1000,
+									GPUFreeMem: node.GpuMemTotal,
+								}
 							}
 						}
 					}
-				}
 
-				node.CpuFree -= request.CpuReq
-				node.MemFree -= request.MemReq
-				if request.GpuReq > 0 {
-					node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
-					node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
-				}
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
+						node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
+					}
 
-				t := &WorkerResources{
-					Workers:  map[string]string{},
-					Critical: false,
-				}
-				(*tmps[groupIdx])[NewWorkerID(5)] = t
-				if request.GpuReq > 0 {
-					(*t).Workers[cluster.ResourceLsalabGPU] = freeGPUID
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*tmps[groupIdx])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceKubeShareGPU] = freeGPUID
+					}
+				} else { // nvidia.com/gpu
+					if request.GpuReq > 0 {
+						if node.GpuFreeCount < int(request.GpuReq/1000) {
+							stop = true
+							log.Infof("Break in nvidia.com/gpu request")
+							break
+						}
+					}
+
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFreeCount -= int(request.GpuReq / 1000)
+					}
+
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*tmps[groupIdx])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceNvidiaGPU] = fmt.Sprintf("%d", (request.GpuReq / 1000))
+					}
 				}
 				okNum[groupIdx]++
 			}
@@ -715,9 +784,16 @@ func ScaleDown(highPriorityJob *cluster.PodRequests, runningQueue JobQueue, cons
 				res := nodeRes[nodeName]
 				res.CpuFree += runJobReq.CpuReq
 				res.MemFree += runJobReq.MemReq
-				if gpuid, ok := (*worker).Workers[cluster.ResourceLsalabGPU]; ok {
-					res.GpuFree[gpuid].GPUFreeReq += runJobReq.GpuReq
-					res.GpuFree[gpuid].GPUFreeMem += runJobReq.GpuMemReq
+
+				if option.KubeShareSupport { // kubeshare/gpu
+					if gpuid, ok := (*worker).Workers[cluster.ResourceKubeShareGPU]; ok {
+						res.GpuFree[gpuid].GPUFreeReq += runJobReq.GpuReq
+						res.GpuFree[gpuid].GPUFreeMem += runJobReq.GpuMemReq
+					}
+				} else { // nvidia.com/gpu
+					if _, ok := (*worker).Workers[cluster.ResourceNvidiaGPU]; ok {
+						res.GpuFreeCount += int(runJobReq.GpuReq / 1000)
+					}
 				}
 				// log.Infof("************************************ DEBUG ************************************")
 				// nodeRes.PrintMe()
@@ -772,49 +848,80 @@ func ScaleUp(runningQueue JobQueue, constNodeRes cluster.NodeResources) (can boo
 					break
 				}
 
-				hasFreeGPU, freeGPUID := false, ""
-				if request.GpuReq > 0 {
-					for id, gpu := range node.GpuFree {
-						if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
-							hasFreeGPU, freeGPUID = true, id
-							break
+				if option.KubeShareSupport { // kubeshare/gpu
+					hasFreeGPU, freeGPUID := false, ""
+					if request.GpuReq > 0 {
+						for id, gpu := range node.GpuFree {
+							if gpu.GPUFreeReq >= request.GpuReq && gpu.GPUFreeMem >= request.GpuMemReq {
+								hasFreeGPU, freeGPUID = true, id
+								break
+							}
 						}
-					}
-					if !hasFreeGPU {
-						if node.GpuFreeCount <= 0 {
-							stop = true
-							break
-						} else {
-							node.GpuFreeCount--
-							freeGPUID = kubesharev1.NewGPUID(5)
-							node.GpuFree[freeGPUID] = &cluster.GPUInfo{
-								GPUFreeReq: 1000,
-								GPUFreeMem: node.GpuMemTotal,
+						if !hasFreeGPU {
+							if node.GpuFreeCount <= 0 {
+								stop = true
+								break
+							} else {
+								node.GpuFreeCount--
+								freeGPUID = kubesharev1.NewGPUID(5)
+								node.GpuFree[freeGPUID] = &cluster.GPUInfo{
+									GPUFreeReq: 1000,
+									GPUFreeMem: node.GpuMemTotal,
+								}
 							}
 						}
 					}
-				}
 
-				node.CpuFree -= request.CpuReq
-				node.MemFree -= request.MemReq
-				if request.GpuReq > 0 {
-					node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
-					node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
-				}
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFree[freeGPUID].GPUFreeReq -= request.GpuReq
+						node.GpuFree[freeGPUID].GPUFreeMem -= request.GpuMemReq
+					}
 
-				if _, ok := scaleUpTarget[job]; !ok {
-					scaleUpTarget[job] = job.ReplicasPlacementPlan[tfv1.TFReplicaTypeWorker].DeepCopy()
-				}
-				if _, ok := (*scaleUpTarget[job])[nodeName]; !ok {
-					(*scaleUpTarget[job])[nodeName] = &NodeResPlacePlan{}
-				}
-				t := &WorkerResources{
-					Workers:  map[string]string{},
-					Critical: false,
-				}
-				(*(*scaleUpTarget[job])[nodeName])[NewWorkerID(5)] = t
-				if request.GpuReq > 0 {
-					(*t).Workers[cluster.ResourceLsalabGPU] = freeGPUID
+					if _, ok := scaleUpTarget[job]; !ok {
+						scaleUpTarget[job] = job.ReplicasPlacementPlan[tfv1.TFReplicaTypeWorker].DeepCopy()
+					}
+					if _, ok := (*scaleUpTarget[job])[nodeName]; !ok {
+						(*scaleUpTarget[job])[nodeName] = &NodeResPlacePlan{}
+					}
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*(*scaleUpTarget[job])[nodeName])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceKubeShareGPU] = freeGPUID
+					}
+				} else { // nvidia.com/gpu
+					if request.GpuReq > 0 {
+						if node.GpuFreeCount < int(request.GpuReq/1000) {
+							stop = true
+							log.Infof("Break in nvidia.com/gpu request")
+							break
+						}
+					}
+
+					node.CpuFree -= request.CpuReq
+					node.MemFree -= request.MemReq
+					if request.GpuReq > 0 {
+						node.GpuFreeCount -= int(request.GpuReq / 1000)
+					}
+
+					if _, ok := scaleUpTarget[job]; !ok {
+						scaleUpTarget[job] = job.ReplicasPlacementPlan[tfv1.TFReplicaTypeWorker].DeepCopy()
+					}
+					if _, ok := (*scaleUpTarget[job])[nodeName]; !ok {
+						(*scaleUpTarget[job])[nodeName] = &NodeResPlacePlan{}
+					}
+					t := &WorkerResources{
+						Workers:  map[string]string{},
+						Critical: false,
+					}
+					(*(*scaleUpTarget[job])[nodeName])[NewWorkerID(5)] = t
+					if request.GpuReq > 0 {
+						(*t).Workers[cluster.ResourceNvidiaGPU] = fmt.Sprintf("%d", (request.GpuReq / 1000))
+					}
 				}
 
 				can = true

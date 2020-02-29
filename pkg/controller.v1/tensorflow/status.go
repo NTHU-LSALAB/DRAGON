@@ -19,10 +19,10 @@ import (
 	"fmt"
 	"time"
 
-	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	common "github.com/NTHU-LSALAB/DRAGON/pkg/apis/common/v1"
 	tfv1 "github.com/NTHU-LSALAB/DRAGON/pkg/apis/tensorflow/v1"
 	tflogger "github.com/NTHU-LSALAB/DRAGON/pkg/logger"
+	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	v1 "k8s.io/api/core/v1"
@@ -194,7 +194,20 @@ func initializeTFReplicaStatuses(tfjob *tfv1.TFJob, rtype tfv1.TFReplicaType) {
 }
 
 // updateTFJobReplicaStatuses updates the TFJobReplicaStatuses according to the pod.
-func updateTFJobReplicaStatuses(tfjob *tfv1.TFJob, rtype tfv1.TFReplicaType, pod *kubesharev1.SharePod) {
+func updateTFJobReplicaStatusesForPod(tfjob *tfv1.TFJob, rtype tfv1.TFReplicaType, pod *v1.Pod) {
+	commonType := common.ReplicaType(rtype)
+	switch pod.Status.Phase {
+	case v1.PodRunning:
+		tfjob.Status.ReplicaStatuses[commonType].Active++
+	case v1.PodSucceeded:
+		tfjob.Status.ReplicaStatuses[commonType].Succeeded++
+	case v1.PodFailed:
+		tfjob.Status.ReplicaStatuses[commonType].Failed++
+	}
+}
+
+// updateTFJobReplicaStatuses updates the TFJobReplicaStatuses according to the pod.
+func updateTFJobReplicaStatusesForSharePod(tfjob *tfv1.TFJob, rtype tfv1.TFReplicaType, pod *kubesharev1.SharePod) {
 	commonType := common.ReplicaType(rtype)
 	if pod.Status.PodStatus != nil {
 		switch pod.Status.PodStatus.Phase {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/NTHU-LSALAB/DRAGON/cmd/DRAGON/app/options"
 	"github.com/kubernetes-sigs/kube-batch/pkg/apis/scheduling/v1alpha1"
 	kubebatchclient "github.com/kubernetes-sigs/kube-batch/pkg/client/clientset/versioned"
 	log "github.com/sirupsen/logrus"
@@ -27,10 +28,10 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/kubernetes/pkg/controller"
 
+	"github.com/NTHU-LSALAB/DRAGON/pkg/control"
 	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	kubeshareclientset "github.com/NTHU-LSALAB/KubeShare/pkg/client/clientset/versioned"
 	kubesharelisters "github.com/NTHU-LSALAB/KubeShare/pkg/client/listers/kubeshare/v1"
-	"github.com/NTHU-LSALAB/DRAGON/pkg/control"
 )
 
 // Common Interface to be implemented by all operators.
@@ -144,6 +145,8 @@ type JobController struct {
 
 	/*************** ERICYEH ***************/
 
+	Option *options.ServerOption
+
 	SharePodClientSet kubeshareclientset.Interface
 
 	SharePodLister kubesharelisters.SharePodLister
@@ -164,6 +167,7 @@ func NewJobController(
 	kubeshareClientSet kubeshareclientset.Interface,
 	kubeBatchClientSet kubebatchclient.Interface,
 	kubeInformerFactory kubeinformers.SharedInformerFactory,
+	option *options.ServerOption,
 	workQueueName string) JobController {
 
 	log.Debug("Creating event broadcaster")
@@ -176,6 +180,7 @@ func NewJobController(
 		KubeClient:     kubeClientSet,
 		SharePodClient: kubeshareClientSet,
 		Recorder:       eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: controllerImpl.ControllerName()}),
+		Option:         option,
 	}
 
 	realServiceControl := control.RealServiceControl{
@@ -196,6 +201,7 @@ func NewJobController(
 		KubeClientSet:      kubeClientSet,
 		SharePodClientSet:  kubeshareClientSet,
 		KubeBatchClientSet: kubeBatchClientSet,
+		Option:             option,
 		Expectations:       controller.NewControllerExpectations(),
 		WorkQueue:          workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), workQueueName),
 		Recorder:           recorder,

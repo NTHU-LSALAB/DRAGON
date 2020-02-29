@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
-	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	common "github.com/NTHU-LSALAB/DRAGON/pkg/apis/common/v1"
 	tfv1 "github.com/NTHU-LSALAB/DRAGON/pkg/apis/tensorflow/v1"
 	"github.com/NTHU-LSALAB/DRAGON/pkg/common/jobcontroller"
@@ -33,6 +32,7 @@ import (
 	"github.com/NTHU-LSALAB/DRAGON/pkg/controller.v1/DRAGON/scheduling"
 	tflogger "github.com/NTHU-LSALAB/DRAGON/pkg/logger"
 	train_util "github.com/NTHU-LSALAB/DRAGON/pkg/util/train"
+	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 )
 
 const (
@@ -55,6 +55,148 @@ const (
 // reconcilePods checks and updates pods for each given TFReplicaSpec.
 // It will requeue the tfjob in case of an error while creating/deleting pods.
 func (tc *TFController) reconcilePods(
+	tfjob *tfv1.TFJob,
+	pods []*v1.Pod,
+	rtype tfv1.TFReplicaType,
+	spec *common.ReplicaSpec,
+	rstatus map[string]v1.PodPhase,
+	placementPlan *scheduling.JobPlacementPlan,
+) (error, []int) {
+
+	// Convert TFReplicaType to lower string.
+	rt := strings.ToLower(string(rtype))
+	logger := tflogger.LoggerForReplica(tfjob, rt)
+	// Get all pods for the type rt.
+	pods, err := tc.FilterPodsForReplicaType(pods, rt)
+	if err != nil {
+		return err, nil
+	}
+
+	replicas := placementPlan.Count()
+	restart := false
+	worker0Completed := false
+
+	initializeTFReplicaStatuses(tfjob, rtype)
+
+	podSlices := tc.GetPodSlices(pods, int(*tfjob.Spec.MaxInstances), logger)
+	createLater := make(scheduling.JobPlacementPlan)
+	usedIndex := make([]int, 0, replicas)
+
+	for nodeName, workers := range *placementPlan {
+		for workerID, worker := range *workers {
+			if val, ok := podSlices[workerID]; !ok {
+				if _, ok := createLater[nodeName]; !ok {
+					createLater[nodeName] = &scheduling.NodeResPlacePlan{workerID: worker}
+				} else {
+					(*createLater[nodeName])[workerID] = worker
+				}
+			} else {
+				if len(val) > 1 {
+					logger.Warningf("We have too many pods for %s", rt)
+					// TODO(gaocegege): Kill some pods.
+				} else if len(val) == 1 {
+					delete(podSlices, workerID)
+
+					// Check the status of the current pod.
+					pod := val[0]
+
+					index, err := strconv.Atoi(pod.Labels[tfReplicaIndexLabel])
+					if err != nil {
+						logger.Errorf("Pod Label replica index is not a number! %s", pod.Labels[tfReplicaIndexLabel])
+					}
+					usedIndex = append(usedIndex, index)
+
+					// Get the exit code of the tensorflow container.
+					var exitCode int32 = 0xbeef // magic number
+					for _, status := range pod.Status.ContainerStatuses {
+						state := status.State
+						if status.Name == tfv1.DefaultContainerName && state.Terminated != nil {
+							exitCode = state.Terminated.ExitCode
+							logger.Infof("Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
+							tc.Recorder.Eventf(tfjob, v1.EventTypeNormal, exitedWithCodeReason, "Pod: %v.%v exited with code %v", pod.Namespace, pod.Name, exitCode)
+						}
+					}
+					// Check if the pod is retryable.
+					if spec.RestartPolicy == common.RestartPolicyExitCode {
+						if pod.Status.Phase == v1.PodFailed && train_util.IsRetryableExitCode(exitCode) {
+							logger.Infof("Need to restart the pod: %v.%v", pod.Namespace, pod.Name)
+							if err := tc.PodControl.DeletePod(pod.Namespace, pod.Name, tfjob); err != nil {
+								// return err
+								logger.Errorf("Error when deleting Pod: %s", err.Error())
+							}
+							restart = true
+						}
+					}
+
+					// Check whether worker 0 is exited without error.
+					if rtype == tfv1.TFReplicaTypeWorker && index == 0 && exitCode == 0 {
+						worker0Completed = true
+					}
+					updateTFJobReplicaStatusesForPod(tfjob, rtype, pod)
+				}
+			}
+		}
+	}
+
+	sort.Ints(usedIndex)
+	logger.Infof("usedIndex: %v", usedIndex)
+
+	usedIndexCopy := make([]int, len(usedIndex))
+	copy(usedIndexCopy, usedIndex)
+	logger.Infof("ERICYEH: %v", usedIndexCopy)
+
+	usedIndexLen := len(usedIndex)
+	// usedIndex_i is Index of usedIndex
+	usedIndex_i := 0
+	// workerIndex is final index set to worker
+	workerIndex := 0
+
+	masterRole := false
+	for nodeName, workers := range createLater {
+		for workerid, worker := range *workers {
+			// find next available index
+			for ; usedIndex_i < usedIndexLen && workerIndex == usedIndex[usedIndex_i]; usedIndex_i, workerIndex = usedIndex_i+1, workerIndex+1 {
+			}
+			logger.Infof("Worker Index: %d\n", workerIndex)
+			usedIndexCopy = append(usedIndexCopy, workerIndex)
+
+			index := workerIndex
+			masterRole = false
+			logger.Infof("Need to create new pod: %s", rt)
+			// if master pod is present, select the master pod
+			// if master is not present, first worker pod is selected as the master.
+			if ContainChieforMasterSpec(tfjob) {
+				if tfv1.IsChieforMaster(rtype) {
+					masterRole = true
+				}
+			} else {
+				if tfv1.IsWorker(rtype) && (index == 0) {
+					masterRole = true
+				}
+			}
+			if masterRole {
+				worker.Critical = true
+			}
+			err = tc.createNewPod(tfjob, rt, strconv.Itoa(index), spec, masterRole, nodeName, workerid, worker, rtype)
+			if err != nil {
+				// return err, nil
+				logger.Errorf("Error when creating Pod: %s", err.Error())
+			}
+
+			workerIndex++
+		}
+	}
+
+	for _, worker := range podSlices {
+		tc.PodControl.DeletePod(worker[0].Namespace, worker[0].Name, tfjob)
+	}
+
+	return tc.updateStatusSingle(tfjob, rtype, replicas, restart, worker0Completed), usedIndexCopy
+}
+
+// reconcilePods checks and updates pods for each given TFReplicaSpec.
+// It will requeue the tfjob in case of an error while creating/deleting pods.
+func (tc *TFController) reconcileSharePods(
 	tfjob *tfv1.TFJob,
 	pods []*kubesharev1.SharePod,
 	rtype tfv1.TFReplicaType,
@@ -134,7 +276,7 @@ func (tc *TFController) reconcilePods(
 					if rtype == tfv1.TFReplicaTypeWorker && index == 0 && exitCode == 0 {
 						worker0Completed = true
 					}
-					updateTFJobReplicaStatuses(tfjob, rtype, pod)
+					updateTFJobReplicaStatusesForSharePod(tfjob, rtype, pod)
 				}
 			}
 		}
@@ -243,11 +385,11 @@ func (tc *TFController) createNewPod(tfjob *tfv1.TFJob, rt, index string, spec *
 		podTemplate.Annotations = make(map[string]string)
 	}
 
-	if _, ok := (*customDevicesID).Workers[cluster.ResourceLsalabGPU]; ok {
-		podTemplate.Annotations[cluster.ResourceLsalabGPUID] = (*customDevicesID).Workers[cluster.ResourceLsalabGPU]
-		podTemplate.Annotations[cluster.ResourceLsalabGPUReq] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[cluster.ResourceLsalabGPUReq]
-		podTemplate.Annotations[cluster.ResourceLsalabGPULimit] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[cluster.ResourceLsalabGPULimit]
-		podTemplate.Annotations[cluster.ResourceLsalabGPUMem] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[cluster.ResourceLsalabGPUMem]
+	if _, ok := (*customDevicesID).Workers[cluster.ResourceKubeShareGPU]; ok {
+		podTemplate.Annotations[kubesharev1.KubeShareResourceGPUID] = (*customDevicesID).Workers[cluster.ResourceKubeShareGPU]
+		podTemplate.Annotations[kubesharev1.KubeShareResourceGPURequest] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[kubesharev1.KubeShareResourceGPURequest]
+		podTemplate.Annotations[kubesharev1.KubeShareResourceGPULimit] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[kubesharev1.KubeShareResourceGPULimit]
+		podTemplate.Annotations[kubesharev1.KubeShareResourceGPUMemory] = tfjob.Spec.TFReplicaSpecs[rtype].Template.Annotations[kubesharev1.KubeShareResourceGPUMemory]
 	}
 
 	/****************** Custom Devices Configuration ******************/

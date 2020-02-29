@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/controller"
 
+	"github.com/NTHU-LSALAB/DRAGON/cmd/DRAGON/app/options"
 	kubesharev1 "github.com/NTHU-LSALAB/KubeShare/pkg/apis/kubeshare/v1"
 	kubeshareclientset "github.com/NTHU-LSALAB/KubeShare/pkg/client/clientset/versioned"
 )
@@ -59,6 +60,8 @@ type RealPodControl struct {
 	KubeClient     clientset.Interface
 	SharePodClient kubeshareclientset.Interface
 	Recorder       record.EventRecorder
+
+	Option *options.ServerOption
 }
 
 var _ controller.PodControlInterface = &RealPodControl{}
@@ -104,9 +107,13 @@ func (r RealPodControl) CreatePodsOnNode(nodeName, namespace string, template *v
 }
 
 func (r RealPodControl) PatchPod(namespace, name string, data []byte) error {
-	// _, err := r.KubeClient.CoreV1().Pods(namespace).Patch(name, types.StrategicMergePatchType, data)
-	_, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Patch(name, types.StrategicMergePatchType, data)
-	return err
+	if r.Option.KubeShareSupport {
+		_, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Patch(name, types.StrategicMergePatchType, data)
+		return err
+	} else {
+		_, err := r.KubeClient.CoreV1().Pods(namespace).Patch(name, types.StrategicMergePatchType, data)
+		return err
+	}
 }
 
 func GetPodFromTemplate(template *v1.PodTemplateSpec, parentObject runtime.Object, controllerRef *metav1.OwnerReference) (*v1.Pod, error) {
@@ -144,18 +151,32 @@ func (r RealPodControl) createPods(nodeName, namespace string, template *v1.PodT
 		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
 		Spec:       *pod.Spec.DeepCopy(),
 	}
-	// if newPod, err := r.KubeClient.CoreV1().Pods(namespace).Create(pod); err != nil {
-	if newPod, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Create(sharepod); err != nil {
-		r.Recorder.Eventf(object, v1.EventTypeWarning, FailedCreatePodReason, "Error creating: %v", err)
-		return err
-	} else {
-		accessor, err := meta.Accessor(object)
-		if err != nil {
-			log.Errorf("parentObject does not have ObjectMeta, %v", err)
-			return nil
+	if r.Option.KubeShareSupport {
+		if newPod, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Create(sharepod); err != nil {
+			r.Recorder.Eventf(object, v1.EventTypeWarning, FailedCreatePodReason, "Error creating: %v", err)
+			return err
+		} else {
+			accessor, err := meta.Accessor(object)
+			if err != nil {
+				log.Errorf("parentObject does not have ObjectMeta, %v", err)
+				return nil
+			}
+			log.Infof("Controller %v created pod %v", accessor.GetName(), newPod.Name)
+			r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulCreatePodReason, "Created pod: %v", newPod.Name)
 		}
-		log.Infof("Controller %v created pod %v", accessor.GetName(), newPod.Name)
-		r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulCreatePodReason, "Created pod: %v", newPod.Name)
+	} else {
+		if newPod, err := r.KubeClient.CoreV1().Pods(namespace).Create(pod); err != nil {
+			r.Recorder.Eventf(object, v1.EventTypeWarning, FailedCreatePodReason, "Error creating: %v", err)
+			return err
+		} else {
+			accessor, err := meta.Accessor(object)
+			if err != nil {
+				log.Errorf("parentObject does not have ObjectMeta, %v", err)
+				return nil
+			}
+			log.Infof("Controller %v created pod %v", accessor.GetName(), newPod.Name)
+			r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulCreatePodReason, "Created pod: %v", newPod.Name)
+		}
 	}
 	return nil
 }
@@ -165,25 +186,44 @@ func (r RealPodControl) DeletePod(namespace string, podID string, object runtime
 	if err != nil {
 		return fmt.Errorf("object does not have ObjectMeta, %v", err)
 	}
-	// pod, err := r.KubeClient.CoreV1().Pods(namespace).Get(podID, metav1.GetOptions{})
-	pod, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Get(podID, metav1.GetOptions{})
-	if err != nil {
-		if errors.IsNotFound(err) {
+	if r.Option.KubeShareSupport {
+		pod, err := r.SharePodClient.KubeshareV1().SharePods(namespace).Get(podID, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if pod.Status.PodObjectMeta != nil && pod.Status.PodObjectMeta.DeletionTimestamp != nil {
+			log.Infof("pod %s/%s is terminating, skip deleting", pod.Namespace, pod.Name)
 			return nil
 		}
-		return err
-	}
-	if pod.Status.PodObjectMeta != nil && pod.Status.PodObjectMeta.DeletionTimestamp != nil {
-		log.Infof("pod %s/%s is terminating, skip deleting", pod.Namespace, pod.Name)
-		return nil
-	}
-	log.Infof("Controller %v deleting pod %v/%v", accessor.GetName(), namespace, podID)
-	// if err := r.KubeClient.CoreV1().Podsabc(namespace).Delete(podID, nil); err != nil {
-	if err := r.SharePodClient.KubeshareV1().SharePods(namespace).Delete(podID, nil); err != nil {
-		r.Recorder.Eventf(object, v1.EventTypeWarning, FailedDeletePodReason, "Error deleting: %v", err)
-		return fmt.Errorf("unable to delete pods: %v", err)
+		log.Infof("Controller %v deleting pod %v/%v", accessor.GetName(), namespace, podID)
+		if err := r.SharePodClient.KubeshareV1().SharePods(namespace).Delete(podID, nil); err != nil {
+			r.Recorder.Eventf(object, v1.EventTypeWarning, FailedDeletePodReason, "Error deleting: %v", err)
+			return fmt.Errorf("unable to delete pods: %v", err)
+		} else {
+			r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulDeletePodReason, "Deleted pod: %v", podID)
+		}
 	} else {
-		r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulDeletePodReason, "Deleted pod: %v", podID)
+		pod, err := r.KubeClient.CoreV1().Pods(namespace).Get(podID, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if pod.ObjectMeta.DeletionTimestamp != nil {
+			log.Infof("pod %s/%s is terminating, skip deleting", pod.Namespace, pod.Name)
+			return nil
+		}
+		log.Infof("Controller %v deleting pod %v/%v", accessor.GetName(), namespace, podID)
+		if err := r.KubeClient.CoreV1().Pods(namespace).Delete(podID, nil); err != nil {
+			r.Recorder.Eventf(object, v1.EventTypeWarning, FailedDeletePodReason, "Error deleting: %v", err)
+			return fmt.Errorf("unable to delete pods: %v", err)
+		} else {
+			r.Recorder.Eventf(object, v1.EventTypeNormal, SuccessfulDeletePodReason, "Deleted pod: %v", podID)
+		}
 	}
 	return nil
 }

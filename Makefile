@@ -11,3 +11,6 @@ all: $(TARGET)
 
 DRAGON:
 	$(GO_MODULE) $(ALPINE_COMPILE_FLAGS) $(GO) build -o $(BIN_DIR)$@ $(PACKAGE_PREFIX)$@
+
+clean:
+	rm -r bin 2>/dev/null; exit 0

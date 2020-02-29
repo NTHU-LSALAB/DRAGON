@@ -104,33 +104,38 @@ func Run(opt *options.ServerOption) error {
 	}
 
 	// Create clients.
-	kubeClientSet, leaderElectionClientSet, tfJobClientSet, kubeBatchClientSet, kubeshareClientSet, err := createClientSets(kcfg)
+	kubeClientSet, leaderElectionClientSet, tfJobClientSet, kubeBatchClientSet, kubeshareClientSet, err := createClientSets(kcfg, opt)
 	if err != nil {
 		return err
 	}
-	if !checkCRDExists(tfJobClientSet, opt.Namespace) {
+	if !checkCRDExists(tfJobClientSet, kubeshareClientSet, opt) {
 		log.Info("CRD doesn't exist. Exiting")
 		os.Exit(1)
 	}
 	// Create informer factory.
 	kubeInformerFactory := kubeinformers.NewFilteredSharedInformerFactory(kubeClientSet, opt.ResyncPeriod, opt.Namespace, nil)
 	tfJobInformerFactory := tfjobinformers.NewSharedInformerFactory(tfJobClientSet, opt.ResyncPeriod)
-	kubeshareInformerFactory := kubeshareinformers.NewSharedInformerFactory(kubeshareClientSet, opt.ResyncPeriod)
+	var kubeshareInformerFactory kubeshareinformers.SharedInformerFactory = nil
+	if opt.KubeShareSupport {
+		kubeshareInformerFactory = kubeshareinformers.NewSharedInformerFactory(kubeshareClientSet, opt.ResyncPeriod)
+	}
 
 	unstructuredInformer := controller.NewUnstructuredTFJobInformer(kcfg, opt.Namespace)
 
 	// Create tf controller.
-	tc := controller.NewTFController(unstructuredInformer, kubeClientSet, kubeBatchClientSet, tfJobClientSet, kubeInformerFactory, tfJobInformerFactory, kubeshareClientSet, *opt, kubeshareInformerFactory)
+	tc := controller.NewTFController(unstructuredInformer, kubeClientSet, kubeBatchClientSet, tfJobClientSet, kubeInformerFactory, tfJobInformerFactory, kubeshareClientSet, opt, kubeshareInformerFactory)
 
 	// Start informer goroutines.
 	go kubeInformerFactory.Start(stopCh)
 
 	// We do not use the generated informer because of
-	// https://github.com/NTHU-LSALAB/DRAGON/issues/561
+	// https://github.com/kubeflow/tf-operator/issues/561
 	// go tfJobInformerFactory.Start(stopCh)
 	go unstructuredInformer.Informer().Run(stopCh)
 
-	go kubeshareInformerFactory.Start(stopCh)
+	if opt.KubeShareSupport {
+		go kubeshareInformerFactory.Start(stopCh)
+	}
 
 	// Set leader election start function.
 	run := func(<-chan struct{}) {
@@ -157,7 +162,13 @@ func Run(opt *options.ServerOption) error {
 	rl := &resourcelock.EndpointsLock{
 		EndpointsMeta: metav1.ObjectMeta{
 			Namespace: namespace,
-			Name:      "tf-operator",
+			Name: func() string {
+				if opt.KubeShareSupport {
+					return "tf-operator-kubeshare"
+				} else {
+					return "tf-operator"
+				}
+			}(),
 		},
 		Client: leaderElectionClientSet.CoreV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
@@ -184,7 +195,7 @@ func Run(opt *options.ServerOption) error {
 	return nil
 }
 
-func createClientSets(config *restclientset.Config) (kubeclientset.Interface, kubeclientset.Interface, tfjobclientset.Interface, kubebatchclient.Interface, kubeshareclientset.Interface, error) {
+func createClientSets(config *restclientset.Config, opt *options.ServerOption) (kubeclientset.Interface, kubeclientset.Interface, tfjobclientset.Interface, kubebatchclient.Interface, kubeshareclientset.Interface, error) {
 
 	kubeClientSet, err := kubeclientset.NewForConfig(restclientset.AddUserAgent(config, "tf-operator"))
 	if err != nil {
@@ -206,17 +217,22 @@ func createClientSets(config *restclientset.Config) (kubeclientset.Interface, ku
 		return nil, nil, nil, nil, nil, err
 	}
 
-	kubeshareClientSet, err := kubeshareclientset.NewForConfig(restclientset.AddUserAgent(config, "kubeshare"))
-	if err != nil {
-		return nil, nil, nil, nil, nil, err
+	var kubeshareClientSet *kubeshareclientset.Clientset = nil
+	if opt.KubeShareSupport {
+		ks, err := kubeshareclientset.NewForConfig(restclientset.AddUserAgent(config, "kubeshare"))
+		if err != nil {
+			return nil, nil, nil, nil, nil, err
+		}
+		kubeshareClientSet = ks
 	}
 
 	return kubeClientSet, leaderElectionClientSet, tfJobClientSet, kubeBatchClientSet, kubeshareClientSet, nil
 }
 
-func checkCRDExists(clientset tfjobclientset.Interface, namespace string) bool {
-	_, err := clientset.KubeflowV1().TFJobs(namespace).List(metav1.ListOptions{})
+func checkCRDExists(clientset tfjobclientset.Interface, kubeshareClientSet kubeshareclientset.Interface, opt *options.ServerOption) bool {
+	var err error
 
+	_, err = clientset.KubeflowV1().TFJobs(opt.Namespace).List(metav1.ListOptions{})
 	if err != nil {
 		log.Error(err)
 		if _, ok := err.(*errors.StatusError); ok {
@@ -225,5 +241,18 @@ func checkCRDExists(clientset tfjobclientset.Interface, namespace string) bool {
 			}
 		}
 	}
+
+	if opt.KubeShareSupport {
+		_, err = kubeshareClientSet.KubeshareV1().SharePods(opt.Namespace).List(metav1.ListOptions{})
+		if err != nil {
+			log.Error(err)
+			if _, ok := err.(*errors.StatusError); ok {
+				if errors.IsNotFound(err) {
+					return false
+				}
+			}
+		}
+	}
+
 	return true
 }

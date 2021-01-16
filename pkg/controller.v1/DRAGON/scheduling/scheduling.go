@@ -746,6 +746,7 @@ func ScaleDown(highPriorityJob *cluster.PodRequests, runningQueue JobQueue, cons
 	can = false
 
 	// Run over running jobs to free resources
+	// TODO: Add pre-process for runningQueue(Prioritize the jobs which should be fostered)
 	for _, runJob := range runningQueue {
 		i := int32(0)
 		maxDeleteCount := int32(runJob.ReplicasPlacementPlan[tfv1.TFReplicaTypeWorker].Count()) - *(runJob.Spec.MinInstances)
